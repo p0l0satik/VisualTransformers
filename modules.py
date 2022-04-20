@@ -24,7 +24,6 @@ class CustomMultiHeadSelfAttention(nn.Module):
         """
         qkv - query, key and value - it should be the same tensor since we implement self-attention
         """
-        print(qkv.shape)
         # custom_mha = CustomMultiHeadSelfAttention(embed_dim=128, num_heads=16)
         # (1, 10, 128)
         # YOUR CODE
@@ -40,7 +39,6 @@ class CustomMultiHeadSelfAttention(nn.Module):
         query, key, value = torch.tensor_split(lin_qkv, 3, dim=2)
         # query, key, value = torch.split(lin_qkv, self.embed_dim, dim=2)
 
-        print(query.shape, key.shape, value.shape)
         processed_heads = []
         for i in range(self.num_heads):
             Q = query[:, :, i * self.head_dim: (i + 1) * self.head_dim]
@@ -65,6 +63,9 @@ class StepLRWithWarmup(torch.optim.lr_scheduler._LRScheduler):
         self.warmup_epochs = warmup_epochs
         self.warmup_lr_init = warmup_lr_init
         self.min_lr = min_lr
+        self.warup_lr = torch.linspace(self.warmup_lr_init, optimizer.param_groups[0]['lr'], self.warmup_epochs+1)
+        self.curr_lr = optimizer.param_groups[0]['lr']
+        print(optimizer.param_groups[0]['lr'])
 
         super().__init__(optimizer, last_epoch, verbose)
 
@@ -76,7 +77,17 @@ class StepLRWithWarmup(torch.optim.lr_scheduler._LRScheduler):
         if (self.last_epoch == 0):
             return [self.warmup_lr_init for _ in self.optimizer.param_groups]
         # YOUR CODE
-        raise NotImplementedError
+        if (self.last_epoch in [0, self.warmup_epochs]):
+            return  [self.warup_lr[self.last_epoch] for _ in self.optimizer.param_groups]
+        
+        if (self.last_epoch - self.warmup_epochs) % self.step_size == 0 and self.curr_lr * self.gamma > self.min_lr:
+            self.curr_lr *= self.gamma
+            return [self.curr_lr for _ in self.optimizer.param_groups]
+            
+        return [group['lr'] for group in self.optimizer.param_groups]
+
+
+        
 
 
 class TokenizerCCT(nn.Module):
@@ -93,9 +104,9 @@ class TokenizerCCT(nn.Module):
                 # Conv2d(n_input_channels, n_output_channels, kernel_size, stride, padding, bias=False) +
                 #   + ReLU +
                 #   + MaxPool(pooling_kernel_size, pooling_stride, pooling_padding)
-                nn.Conv2d(...),
+                nn.Conv2d(n_input_channels, n_output_channels, kernel_size, stride, padding, bias=False),
                 nn.ReLU(),
-                nn.MaxPool2d(...))
+                nn.MaxPool2d(pooling_kernel_size, pooling_stride, pooling_padding))
 
         self.flattener = nn.Flatten(2, 3)  # flat h,w dims into token dim
 
@@ -114,26 +125,30 @@ class SeqPooling(nn.Module):
     def forward(self, x):
         # YOUR CODE
         # 1. apply self.attention_pool to x
-        w = ...
+        w = self.attention_pool(x)
         # 2. take softmax over the first dim (token dim)
         w = F.softmax(w, dim=1)
         # 3. transpose two last dims of w to make its shape be equal to [N, 1, n_tokens]
-        w = ...
+        w = w.transpose(-2, -1)
 
         # 4. call torch.matmul from 'w' and input tensor 'x'
-        y = ...
+        y = torch.matmul(w, x)
 
         # 5. now 'y' shape is [N, 1, embedding_dim]. Squeeze the second dim
-        y = ...
+        y = torch.squeeze(y, 1)
 
         return y
+
 
 def create_mlp(embedding_dim, mlp_size, dropout_rate):
     return nn.Sequential(
         # YOUR CODE: Linear + GELU + Dropout + Linear + Dropout
-        #nn.Linear(..
+        nn.Linear(embedding_dim, mlp_size), # 2/4/6
+        nn.GELU(),
+        nn.Dropout(dropout_rate),
+        nn.Linear(mlp_size, embedding_dim), # 2/4/6
+        nn.Dropout(dropout_rate),
     )
-
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob=None):
@@ -145,39 +160,39 @@ class DropPath(nn.Module):
             return x
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-        # YOUR CODE: generate random tensor, binarize it, cast to x.dtype, multiply x by the mask,
-        # devide the result on keep_prob
-        random_tensor = torch.rand(...)
-        output = ...
+        # YOUR CODE: generate random tensor, binarize it, cast to x.dtype, multiply x by the mask, 
+        random_tensor = torch.rand(shape, dtype=x.dtype) > self.drop_prob
+        random_tensor = random_tensor.to("cuda:0")
+        output = random_tensor.type(x.dtype) * x / keep_prob
         return output
-
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embedding_dim, num_heads, mlp_size, dropout=0.1, attention_dropout=0.1,
                  drop_path_rate=0.1):
         super().__init__()
         # YOUR CODE
-        self.attention_pre_norm = ...
-        self.attention = torch.nn.MultiheadAttention(...)
+        self.attention_pre_norm = nn.LayerNorm(embedding_dim)
+        self.attention = CustomMultiHeadSelfAttention(
+                embedding_dim, num_heads, attention_dropout
+        )
         self.attention_output_dropout = nn.Dropout(dropout)
 
-        self.mlp_pre_norm = ...
-        self.mlp = create_mlp(...)
+        self.mlp_pre_norm = nn.LayerNorm(embedding_dim)
+        self.mlp = create_mlp(embedding_dim, mlp_size, dropout)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
 
     def forward(self, x):
         # first block
         y = self.attention_pre_norm(x)
-        attention = self.attention(y, y, y)[0]
+        attention = self.attention(y)[0]
         attention = self.attention_output_dropout(attention)
-        x = x + self.drop_path(attention)  # Residual connection
-
+        x = x + self.drop_path(attention)   # Residual connection
+            
         # second block
         y = self.mlp_pre_norm(x)
         y = self.mlp(y)
         x = x + self.drop_path(y)  # Residual connection
         return x
-
 
 class CompactConvTransformer3x1(nn.Module):
     def __init__(self,
@@ -228,20 +243,20 @@ class CompactConvTransformer3x1(nn.Module):
     def forward(self, x):
         # YOUR CODE
         # 1. apply tokenizer to x
-        patch_embeddings = ...
+        patch_embeddings = self.tokenizer(x)
 
         # 2. add position embeddings
         x = patch_embeddings + self.positional_embeddings
 
         # 3. apply transformer encoder blocks
         for block in self.blocks:
-            x = ...
+            x = block(x)
 
         # 4. apply self.norm
-        x = ...
+        x = self.norm(x)
 
         # 5. apply sequence pooling
-        x = ...
+        x = self.pool(x)
 
         # 6. final prediction
         x = self.fc(x)
